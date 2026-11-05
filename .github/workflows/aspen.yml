@@ -1,0 +1,66 @@
+name: Aspen Security Scan
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+jobs:
+  aspen:
+    name: Aspen Guardian AI and Adapt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Needed for the gate check to post a comment on the PR when it blocks
+      # (gate_comment_on_failure, on by default).
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Explicit ref, not the default `github.sha`: for pull_request events that
+          # default resolves to GitHub's synthetic merge-preview commit (base + head
+          # merged), not the actual PR branch tip. Checking that out and pushing HEAD
+          # back (as aspen-connector's commit-back step does) would publish a spurious
+          # merge commit onto the real branch.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      # Pinned to a commit SHA, not @master: a mutable branch ref means a compromised
+      # or unexpectedly changed upstream action would run here immediately, with no
+      # review checkpoint.
+      - uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
+
+      - name: Run Snyk code test
+        run: |
+          set +e
+          snyk code test . --sarif-file-output=snyk-code-raw.json
+          echo "SNYK_EXIT_CODE=$?" >> "$GITHUB_ENV"
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Process scan results with Aspen
+        if: always()
+        uses: SecurityJourney/aspen-connector@v0.2.0
+        with:
+          api_token: ${{ secrets.SECURITYJOURNEY_TOKEN }}
+          scan_results_path: snyk-code-raw.json
+          instruction_file_path: .github/ai-instructions.md
+          # Gate runs first and short-circuits before scan processing/commit-back
+          # if the PR author hasn't completed their required training.
+          enforce_gate: 'true'
+
+      - name: Fail on Snyk vulnerabilities
+        if: always()
+        run: |
+          # Snyk exit codes: 0 = no issues, 1 = issues found, 2 = error running
+          # the test (e.g. Snyk unreachable), 3 = no supported files. Only gate
+          # merges on 1 so a Snyk outage doesn't block PRs.
+          if [ "$SNYK_EXIT_CODE" == "1" ]; then
+            echo "Snyk found vulnerabilities. Fix them before merging."
+            exit 1
+          elif [ "$SNYK_EXIT_CODE" == "2" ]; then
+            echo "::warning::Snyk failed to run (exit code 2); scan results may be incomplete."
+          fi
